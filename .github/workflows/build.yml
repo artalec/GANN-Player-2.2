@@ -1,0 +1,208 @@
+name: Build DJPlayer
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Check project layout
+        run: |
+          set -euo pipefail
+          test -f Package.swift || { echo "::error::Package.swift не найден в корне репозитория"; exit 1; }
+          test -d Sources || { echo "::error::Папка Sources не найдена в корне репозитория"; exit 1; }
+          ls -la
+          ls -la Sources
+
+      # Тесты идут до сборки .app: формат файла состояния и миграции должны быть
+      # проверены раньше, чем артефакт попадёт к пользователю.
+      - name: Test
+        run: swift test
+
+      - name: Build (release, universal)
+        run: |
+          set -euo pipefail
+          # Универсальный бинарник: на Apple Silicon и на Intel один и тот же архив.
+          swift build -c release --arch arm64 --arch x86_64
+
+      - name: Assemble .app bundle
+        run: |
+          set -euo pipefail
+          BIN_DIR="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)"
+          BIN="$BIN_DIR/DJPlayer"
+          test -f "$BIN" || { echo "::error::Бинарник $BIN не найден"; exit 1; }
+
+          APP="GANN Player.app"
+          rm -rf "$APP"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "$BIN" "$APP/Contents/MacOS/DJPlayer"
+          chmod +x "$APP/Contents/MacOS/DJPlayer"
+          printf 'APPL????' > "$APP/Contents/PkgInfo"
+
+          # Иконка приложения.
+          if [ -f Resources/AppIcon.icns ]; then
+            cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+          else
+            echo "::warning::Resources/AppIcon.icns не найден — приложение будет без иконки"
+          fi
+
+          # Info.plist берётся из репозитория, а не переписывается здесь: две копии
+          # настроек неизбежно расходятся, и версия в бандле перестаёт совпадать
+          # с LSMinimumSystemVersion из Package.swift.
+          test -f Resources/Info.plist || { echo "::error::Resources/Info.plist не найден"; exit 1; }
+          cp Resources/Info.plist "$APP/Contents/Info.plist"
+          plutil -lint "$APP/Contents/Info.plist"
+
+          # Версия в бандле должна совпадать с версией в репозитории.
+          BUNDLED="$(plutil -extract CFBundleShortVersionString raw "$APP/Contents/Info.plist")"
+          SOURCE="$(plutil -extract CFBundleShortVersionString raw Resources/Info.plist)"
+          test "$BUNDLED" = "$SOURCE" || { echo "::error::Версия в бандле ($BUNDLED) не совпадает с ($SOURCE)"; exit 1; }
+
+          # Архитектуры бинарника: должно быть обе.
+          lipo -info "$APP/Contents/MacOS/DJPlayer"
+
+          ls -laR "$APP/Contents" | head -50
+
+      # Сертификат Developer ID из секрета во временную связку ключей.
+      # Если секрета нет — шаг пропускается, подпись будет ad-hoc.
+      - name: Import signing certificate
+        id: cert
+        if: env.BUILD_CERTIFICATE_BASE64 != ''
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/djplayer-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+
+          echo -n "$BUILD_CERTIFICATE_BASE64" | base64 --decode -o "$RUNNER_TEMP/cert.p12"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$P12_PASSWORD" -T /usr/bin/codesign
+
+          # Без этого codesign не получит доступ к ключу в неинтерактивном режиме
+          # и подпись упадёт с «errSecInternalComponent».
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+
+          # Проверяем, что сертификат действительно виден codesign.
+          security find-identity -v -p codesigning "$KEYCHAIN"
+          echo "keychain=$KEYCHAIN" >> "$GITHUB_OUTPUT"
+          rm -f "$RUNNER_TEMP/cert.p12"
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+
+      - name: Sign
+        run: |
+          set -euo pipefail
+          APP="GANN Player.app"
+
+          if [ -n "${DEVELOPER_ID_APPLICATION:-}" ] && [ -n "${KEYCHAIN_PATH:-}" ]; then
+            echo "Подпись Developer ID: $DEVELOPER_ID_APPLICATION"
+
+            # --deep устарел и подписывает вложенное неверно. Здесь вложенный код —
+            # один бинарник, поэтому подписываем его явно, затем бандл.
+            # --timestamp обязателен: без метки времени нотаризация отклоняется.
+            codesign --force --options runtime --timestamp \
+              --sign "$DEVELOPER_ID_APPLICATION" \
+              "$APP/Contents/MacOS/DJPlayer"
+
+            codesign --force --options runtime --timestamp \
+              --sign "$DEVELOPER_ID_APPLICATION" \
+              --entitlements Resources/DJPlayer.entitlements \
+              "$APP"
+          else
+            echo "::notice::Секреты Developer ID не заданы — используется ad-hoc подпись"
+            # Ad-hoc подпись всё равно обязательна: на Apple Silicon не подписанный
+            # бинарник не запускается вовсе.
+            codesign --force --sign - \
+              --entitlements Resources/DJPlayer.entitlements \
+              "$APP"
+          fi
+
+          codesign --verify --strict --verbose=2 "$APP"
+          codesign -dv --verbose=4 "$APP" 2>&1 | head -20
+          echo "--- entitlements ---"
+          codesign -d --entitlements - "$APP" 2>&1 | head -30
+        env:
+          DEVELOPER_ID_APPLICATION: ${{ secrets.DEVELOPER_ID_APPLICATION }}
+          KEYCHAIN_PATH: ${{ steps.cert.outputs.keychain }}
+
+      # Нотаризация: нужна, чтобы приложение запускалось без обхода Gatekeeper.
+      # Требует Apple ID, Team ID и app-specific password.
+      - name: Notarize
+        if: env.DEVELOPER_ID_APPLICATION != '' && env.APPLE_ID != '' && env.APPLE_APP_PASSWORD != ''
+        run: |
+          set -euo pipefail
+          APP="GANN Player.app"
+
+          # notarytool принимает zip; ditto сохраняет права и структуру бандла.
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$RUNNER_TEMP/notarize.zip"
+
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --timeout 20m \
+            --wait
+
+          # Тикет прикрепляется к бандлу: без staple приложение проверяет подпись
+          # по сети при каждом запуске и не работает офлайн.
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+
+          # Финальная проверка: именно её выполняет Gatekeeper у пользователя.
+          spctl --assess --type execute --verbose=4 "$APP"
+        env:
+          DEVELOPER_ID_APPLICATION: ${{ secrets.DEVELOPER_ID_APPLICATION }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+
+      - name: Report signing status
+        run: |
+          set -euo pipefail
+          APP="GANN Player.app"
+          if spctl --assess --type execute "$APP" 2>/dev/null; then
+            echo "::notice::Приложение подписано и нотаризовано — запустится без предупреждений"
+          else
+            echo "::warning::Приложение не нотаризовано. Пользователю нужно снять карантин: xattr -dr com.apple.quarantine \"$APP\""
+          fi
+
+      - name: Archive .app
+        run: |
+          set -euo pipefail
+          # ditto сохраняет расширенные атрибуты и подпись кода; zip из Finder их теряет.
+          ditto -c -k --sequesterRsrc --keepParent "GANN Player.app" "GANN Player.app.zip"
+          ls -lh "GANN Player.app.zip"
+
+      # Связка ключей живёт до конца job: удаляем явно, чтобы секреты не оставались.
+      - name: Clean up keychain
+        if: always() && steps.cert.outputs.keychain != ''
+        run: |
+          security delete-keychain "${{ steps.cert.outputs.keychain }}" || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GANN-Player-macOS
+          path: GANN Player.app.zip
+          retention-days: 30
