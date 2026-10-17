@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  App Sandbox намеренно НЕ включён.
+
+	  Плейлисты хранят абсолютные пути к файлам и должны воспроизводиться после
+	  перезапуска. В песочнице такой доступ требует security-scoped bookmarks,
+	  сохранённых для каждого трека: без них AVAudioFile(forReading:) получает
+	  отказ, и все треки после перезапуска становятся «файл не найден».
+	  Включение sandbox без перехода на bookmarks — регресс, а не улучшение.
+
+	  Ключ оставлен явным, чтобы намерение было видно в подписи: приложение
+	  работает с файлами, которые пользователь выбрал сам, и ничего не пишет
+	  за пределы ~/Library/Application Support/DJPlayer.
+	-->
+	<key>com.apple.security.app-sandbox</key>
+	<false/>
+
+	<!-- Действует только при включённом sandbox. Прописано заранее, чтобы
+	     будущий переход на bookmarks не потребовал менять подпись. -->
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
+
+	<key>com.apple.security.files.bookmarks.app-scope</key>
+	<true/>
+</dict>
+</plist>
